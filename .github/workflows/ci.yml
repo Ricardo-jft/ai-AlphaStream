@@ -16,7 +16,7 @@ jobs:
     name: Backend syntax + import smoke (Python 3.12)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: ./frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -60,6 +60,6 @@ jobs:
     needs: [backend-check, frontend-build]
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build prod stack
         run: docker compose -f docker-compose.prod.yml build
