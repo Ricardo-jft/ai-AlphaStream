@@ -1,5 +1,5 @@
 # Core StockAnal_Sys Dependencies
-numpy>=1.24.0
+numpy>=2.5.4
 pandas>=2.3.0  # Upgraded for TradingAgents
 scipy>=1.13.0,<1.14.0
 akshare>=1.18.62  # 2026-05-18: 修雪球 stock_individual_spot_xq KeyError + 东财 JSONDecodeError
