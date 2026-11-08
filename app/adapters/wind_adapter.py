@@ -1,0 +1,765 @@
+# -*- coding: utf-8 -*-
+"""
+Wind MCP Adapter - 工具扩展版（2026-07-09）
+
+协议对齐度: ✅ 100% (initialize/SSE/缓存/配额/熔断)
+工具覆盖度: 6/10 官方工具 (60%)
+
+已实现工具（6个）:
+1. get_stock_basicinfo (B档7d) - 公司档案 → get_company_profile
+2. get_stock_fundamentals (S档30d) - 基本面财务 → get_financials
+3. get_index_stocks (S档7d) - 指数成分 → get_index_info [NEW]
+4. get_industry_detail (B档7d) - 行业详情 → get_industry_detail [NEW]
+5. get_industry_stocks (B档7d) - 行业成分 → get_industry_stocks [NEW]
+6. get_price_volume_technicals (A档1d) - 量价技术 → get_price_volume_technicals [NEW]
+
+策略性跳过（4个）:
+- get_index_quotes: 指数高频行情（避免烧积分）
+- get_stock_quote: 分钟级行情（避免烧积分）
+- get_stock_technicals: 实时技术指标（避免烧积分）
+- search_stocks: 选股筛选（非核心需求）
+
+配额: S50/A30/B20 日配额，S/A/B 硬隔离
+缓存: WindCache 命中 0 积分，失败熔断 300s
+监控: /api/wind/quota 实时查询
+调试: /api/wind/tools 工具列表
+
+Input: A股代码（如 600519）、WIND_API_KEY（env）、各档配额/缓存（wind_budget）、MCP over HTTP 端点
+Output: Dict（基本信息/财务）或降级值（[]/{}/None）；统一过 WindCache（省积分）+ WindQuota（控额度）
+Pos: app/adapters/wind_adapter.py - Wind(万得) MCP HTTP 数据源适配器
+
+一旦我被修改，请更新我的头部注释，以及所属文件夹的 md。
+
+[NEW-FILE:#20260529-WIND-02]
+
+MCP over HTTP + JSON-RPC 2.0：
+- 端点 https://mcp.wind.com.cn/vserver_{server_type}/mcp/
+- 两步握手：initialize（protocolVersion 2025-03-26，30s）→ tools/call（600s，env WIND_CALL_TIMEOUT）。
+- 传输格式：Wind MCP 以 Content-Type: text/event-stream（SSE）返回，
+  body 形如 `event: message\\r\\ndata: {"jsonrpc":"2.0",...}`。initialize 与 tools/call 两步均为 SSE。
+  故响应统一过 _parse_mcp_response：SSE 时收集 data: 行取最后一条有效 JSON-RPC；否则走 resp.json()。
+- 业务解析：payload["result"]["content"][0]["text"]，若为 JSON 字符串则二次 json.loads。
+- 入参：所有工具 inputSchema required=["question"]（自然语言查询），可选 lang（enum English/中文）。
+  按确定性模板构造 question（嵌入 windcode/参数保证 cache_key 稳定）。
+"""
+import os
+import json
+import time
+import logging
+import threading
+from contextvars import ContextVar
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+import httpx
+
+from .base_adapter import BaseAdapter
+from ..core.wind_budget import WindCache, WindQuota
+
+logger = logging.getLogger(__name__)
+
+# 请求级 Wind 开关（opt-in 省积分）。None=未设置 → 读 WIND_USE_DEFAULT（默认 false）
+_use_wind_cv: ContextVar[Optional[bool]] = ContextVar('use_wind', default=None)
+
+
+def set_use_wind(enabled: bool) -> None:
+    """绑定当前执行上下文是否允许走 Wind 付费路径。"""
+    _use_wind_cv.set(bool(enabled))
+
+
+def is_use_wind_enabled() -> bool:
+    """True 才允许 Wind 出站/烧配额。默认关闭（opt-in）。
+
+    优先级：ContextVar（请求头 X-Use-Wind / body.use_wind）>
+    env WIND_USE_DEFAULT（兼容「有 key 即用」旧行为）。
+    """
+    v = _use_wind_cv.get()
+    if v is not None:
+        return bool(v)
+    return os.getenv('WIND_USE_DEFAULT', 'false').strip().lower() in (
+        '1', 'true', 'yes', 'on',
+    )
+
+
+def parse_use_wind_flag(raw: Any) -> bool:
+    """将 header/query/body 原始值解析为 bool。"""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Wind MCP 协议版本（initialize 握手）
+_WIND_PROTOCOL_VERSION = "2025-03-26"
+_WIND_INIT_TIMEOUT = 30.0
+_WIND_ENDPOINT_TMPL = "https://mcp.wind.com.cn/vserver_{server_type}/mcp/"
+
+# TTL 常量（秒）
+_TTL_7D = 7 * 24 * 3600
+_TTL_30D = 30 * 24 * 3600
+
+# 视为「配额/鉴权」类错误码（静默降级，不抛穿透）
+_QUOTA_ERROR_CODES = {'QUOTA_ERROR', 'QPS_LIMIT', 'BALANCE_INSUFFICIENT', 'RATE_LIMITED'}
+_AUTH_ERROR_CODES = {'AUTH_ERROR', 'UNAUTHORIZED', 'INVALID_API_KEY'}
+
+# P2d-B：Wind get_stock_fundamentals / get_stock_basicinfo 的真实 inputSchema 仅
+# required=["question"]（自然语言查询），无结构化 windcode/indicators 参数。
+# 故按 schema 用确定性 question 模板传参（嵌入 windcode 保证 cache_key 稳定，不随机）。
+# 语言固定中文（schema enum: English/中文，default 中文）。
+_WIND_LANG = "中文"
+# 财务：覆盖核心盈利/规模/估值指标（ROE/营收/净利润/毛利率/净利率/PE/PB）。
+_FUNDAMENTALS_Q_TMPL = (
+    "查询{windcode}最新报告期的ROE、营业收入、净利润、毛利率、净利率、市盈率PE-TTM、市净率PB"
+)
+# 基本档案：标准档案查询。
+_BASICINFO_Q_TMPL = "查询{windcode}股票的基本档案"
+
+
+def _to_windcode(code: str) -> str:
+    """A股 6 位代码 → Wind windcode（带 .SH/.SZ 后缀）。
+
+    规则：
+      6xxxxx → .SH（沪市主板/科创板）
+      0xxxxx / 3xxxxx → .SZ（深市主板/创业板）
+      已含 . 的原样返回。
+    """
+    code = (code or '').strip().upper()
+    if '.' in code:
+        return code
+    if code.startswith('6'):
+        return f"{code}.SH"
+    if code.startswith('3') or code.startswith('0'):
+        return f"{code}.SZ"
+    # 兜底：无法判断时默认沪市（不抛异常）
+    return f"{code}.SH"
+
+
+class WindAdapter(BaseAdapter):
+    """Wind(万得) MCP HTTP 数据源适配器（P1 底层，未注册）。
+
+    所有取数均过 _call_wind：缓存优先 → 配额闸门 → HTTP 调用 → 写缓存。
+    未配置 WIND_API_KEY → self._enabled=False，所有取数方法直接返回降级值。
+    """
+
+    def __init__(self, api_key: Optional[str] = None,
+                 cache: Optional[WindCache] = None,
+                 quota: Optional[WindQuota] = None):
+        self.api_key = api_key or os.getenv('WIND_API_KEY', '')
+        self._enabled = bool(self.api_key)
+        self._call_timeout = float(os.getenv('WIND_CALL_TIMEOUT', '600'))
+        # 缓存/配额：默认各自独立 sqlite 引擎，可注入（测试用临时库）
+        self._cache = cache if cache is not None else WindCache()
+        self._quota = quota if quota is not None else WindQuota()
+        # P1.5 失败短时熔断：进程内 {(windcode, tool): last_fail_ts}，RLock 保护。
+        # 冷却窗内对同一 (windcode, tool) 直接降级，不消费额度，避免对故障标的反复烧额度。
+        # 进程重启 dict 清空可接受（熔断仅为短时保护，重启后自然解除）。
+        self._fail_cooldown = float(os.getenv('WIND_FAIL_COOLDOWN', '300'))
+        self._fail_ts: Dict[tuple, float] = {}
+        self._fail_lock = threading.RLock()
+        if not self._enabled:
+            logger.warning(
+                "WIND_API_KEY 未配置，WindAdapter 已禁用；所有取数返回降级值。"
+                "注册进 registry 后 health_check=False 将被自动摘除。"
+            )
+
+    @property
+    def name(self) -> str:
+        return "Wind"
+
+    # ============================ 统一取数入口 ============================
+
+    @staticmethod
+    def _parse_mcp_response(resp):
+        """解析 MCP over HTTP 响应为 JSON-RPC dict（P2c）。
+
+        Wind MCP 以 Content-Type: text/event-stream（SSE）返回，body 形如
+        `event: message\\r\\ndata: {"jsonrpc":"2.0",...}`，对 SSE 直接 resp.json()
+        会抛 JSONDecodeError。处理策略：
+          - content-type 含 text/event-stream → 按行收集以 `data:` 开头的载荷，
+            去前缀 strip 后逐条 json.loads，取最后一条可解析的 JSON-RPC dict；
+          - 否则走原 resp.json()。
+        解析失败抛 ValueError（由调用方 _http_call_wind 的 except 统一降级 None）。
+        """
+        content_type = ''
+        try:
+            content_type = (resp.headers.get('content-type', '') or '').lower()
+        except AttributeError:
+            # 测试/兼容场景：响应对象无 headers → 退回 resp.json()
+            content_type = ''
+
+        if 'text/event-stream' in content_type:
+            last = None
+            for line in (resp.text or '').splitlines():
+                if not line.startswith('data:'):
+                    continue
+                chunk = line[len('data:'):].strip()
+                if not chunk:
+                    continue
+                try:
+                    last = json.loads(chunk)
+                except (TypeError, ValueError):
+                    continue
+            if last is None:
+                raise ValueError('SSE 响应无可解析的 data: JSON 载荷')
+            return last
+
+        # 非 SSE：原 JSON 解析路径
+        return resp.json()
+
+    def _http_call_wind(self, server_type: str, tool: str, arguments: dict):
+        """两步握手 MCP over HTTP；返回解析后的 content 文本（dict/原文）或 None。
+
+        失败（网络/超时/配额/鉴权/解析）一律 WARNING + 返回 None，不向上抛。
+        """
+        endpoint = _WIND_ENDPOINT_TMPL.format(server_type=server_type)
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+        }
+        try:
+            with httpx.Client() as client:
+                # 步骤 1：initialize 握手
+                init_body = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": _WIND_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "StockAnalSys", "version": "1.0"},
+                    },
+                }
+                init_resp = client.post(endpoint, headers=headers, json=init_body,
+                                        timeout=_WIND_INIT_TIMEOUT)
+                init_resp.raise_for_status()
+                # initialize 同为 SSE：过 _parse_mcp_response 校验握手成功（不取业务数据）
+                self._parse_mcp_response(init_resp)
+
+                # 步骤 2：tools/call
+                call_body = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments, "_meta": {}},
+                }
+                resp = client.post(endpoint, headers=headers, json=call_body,
+                                   timeout=self._call_timeout)
+                resp.raise_for_status()
+                payload = self._parse_mcp_response(resp)
+        except httpx.TimeoutException as e:
+            logger.warning(f"Wind 调用超时 tool={tool}: {type(e).__name__}: {e}")
+            return None
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else '?'
+            # 401/403 视为鉴权失败；429 视为限流；均静默降级
+            logger.warning(f"Wind HTTP 错误 tool={tool} status={status}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Wind 调用异常 tool={tool}: {type(e).__name__}: {e}")
+            return None
+
+        # JSON-RPC error 信封
+        if isinstance(payload, dict) and payload.get('error'):
+            logger.warning(f"Wind JSON-RPC error tool={tool}: {payload.get('error')}")
+            return None
+
+        # 解析 result.content[0].text
+        try:
+            content = payload['result']['content']
+            text = content[0]['text']
+        except (KeyError, IndexError, TypeError) as e:
+            logger.warning(f"Wind 响应结构异常 tool={tool}: {type(e).__name__}: {e}")
+            return None
+
+        # text 若为 JSON 字符串则二次解析
+        if isinstance(text, str):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                return {'text': text}
+        else:
+            parsed = text
+
+        # 业务信封 {ok:false, error:{code}} → 配额/鉴权静默降级
+        if isinstance(parsed, dict) and parsed.get('ok') is False:
+            err = parsed.get('error') or {}
+            err_code = str(err.get('code', '')).upper() if isinstance(err, dict) else str(err).upper()
+            if err_code in _QUOTA_ERROR_CODES:
+                logger.warning(f"Wind 额度/限流降级 tool={tool} code={err_code}")
+            elif err_code in _AUTH_ERROR_CODES:
+                logger.warning(f"Wind 鉴权失败降级 tool={tool} code={err_code}")
+            else:
+                logger.warning(f"Wind 业务错误 tool={tool} error={err}")
+            return None
+
+        return parsed
+
+    @staticmethod
+    def _is_business_error(payload) -> bool:
+        """P2d：判断内层业务 dict 是否为失败信封（不应缓存、应降级）。
+
+        Wind 工具层可能返回 200 + SSE，但内层业务 payload 形如
+        {'data': None, 'error': {'code':'invalid_param_name', ...}}。
+        这类响应不是协议层 error（JSON-RPC error）也不是 ok:False 信封，
+        若按成功缓存会污染缓存且使 registry 误判有效、不触发回落。
+        判失败：dict 且含 truthy error 字段（error 为 None/空视为无错误）。
+        """
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get('error'))
+
+    def _in_cooldown(self, key: tuple) -> bool:
+        """P1.5：判断 (windcode, tool) 是否处于失败冷却窗内。"""
+        with self._fail_lock:
+            ts = self._fail_ts.get(key)
+            if ts is None:
+                return False
+            if time.monotonic() - ts < self._fail_cooldown:
+                return True
+            # 冷却窗已过，清除过期记录
+            self._fail_ts.pop(key, None)
+            return False
+
+    def _mark_fail(self, key: tuple) -> None:
+        with self._fail_lock:
+            self._fail_ts[key] = time.monotonic()
+
+    def _clear_fail(self, key: tuple) -> None:
+        with self._fail_lock:
+            self._fail_ts.pop(key, None)
+
+    def _call_wind(self, server_type: str, tool: str, windcode: str,
+                   params: dict, tier: str, ttl_seconds: int) -> Optional[dict]:
+        """统一取数：缓存优先 → 失败熔断 → 配额闸门 → HTTP → 写缓存。
+
+        额度权衡（P1）：HTTP 调用失败不回滚已消费额度——失败已实际消耗 1 次尝试，
+        若回滚会导致网络抖动下对同一标的无限重试持续烧额度，故宁可记 WARNING 计入消耗。
+
+        失败短时熔断（P1.5）：缓存命中仍优先返回（0 积分）；缓存未命中时，若该
+        (windcode, tool) 在冷却窗（WIND_FAIL_COOLDOWN，默认 300s）内，直接降级 None，
+        不消费额度、不发 HTTP；HTTP 失败写入 last_fail_ts，成功则清除该键。
+        """
+        if not self._enabled:
+            return None
+        # 请求级开关：关闭时整段跳过（含缓存），走免费降级链，避免误用付费源
+        if not is_use_wind_enabled():
+            logger.debug(
+                "use_wind=false，跳过 Wind tool=%s windcode=%s", tool, windcode
+            )
+            return None
+
+        # 1) 缓存优先（0 积分）—— 始终最先，熔断不影响缓存命中
+        cached = self._cache.get(tool, windcode, params)
+        if cached is not None:
+            return cached
+
+        fail_key = (windcode, tool)
+
+        # 2) 失败熔断：缓存未命中且在冷却窗内 → 降级，不消费额度
+        if self._in_cooldown(fail_key):
+            logger.warning(
+                f"Wind 熔断冷却中降级（不消费额度）tier={tier} tool={tool} windcode={windcode}"
+            )
+            return None
+
+        # 3) 配额闸门
+        if not self._quota.try_consume(tier):
+            logger.warning(f"Wind 日额度耗尽降级 tier={tier} tool={tool} windcode={windcode}")
+            return None
+
+        # 4) HTTP 调用（失败不回滚额度，见 docstring）
+        result = self._http_call_wind(server_type, tool, params)
+        if result is None:
+            self._mark_fail(fail_key)
+            logger.warning(
+                f"Wind 调用失败但已消耗 1 次 {tier} 档额度，进入熔断冷却 "
+                f"tool={tool} windcode={windcode}"
+            )
+            return None
+
+        # 5) 业务层失败信封（P2d）：内层 dict 含 truthy error，例如缺失必填参数。
+        #    视为失败：不写缓存（避免污染）、返回 None（registry 判无效自动回落）、
+        #    进熔断冷却（param 错误是持久错误，冷却避免反复烧额度）。
+        #    已消费额度不回滚（沿用 P1 权衡，HTTP 已实际发出）。
+        if self._is_business_error(result):
+            self._mark_fail(fail_key)
+            logger.warning(
+                f"Wind 业务失败信封，不缓存并进入熔断冷却 "
+                f"tool={tool} windcode={windcode} error={result.get('error')}"
+            )
+            return None
+
+        # 6) 成功：清除熔断标记 + 写缓存
+        self._clear_fail(fail_key)
+        self._cache.set(tool, windcode, params, result, ttl_seconds, tier)
+        return result
+
+    # ============================ BaseAdapter 6 方法 ============================
+
+    def health_check(self) -> bool:
+        """不烧积分、不连网：仅检查 WIND_API_KEY 是否配置。
+
+        真实连通性（initialize 握手）留 P2 真机验证。
+        """
+        return self._enabled
+
+    def get_stock_info(self, code: str) -> Dict:
+        """股票基本信息（B 档，TTL 7 天）。未启用/降级时返回 {}。"""
+        windcode = _to_windcode(code)
+        params = {
+            'question': _BASICINFO_Q_TMPL.format(windcode=windcode),
+            'lang': _WIND_LANG,
+        }
+        result = self._call_wind(
+            'stock_data', 'get_stock_basicinfo', windcode,
+            params, tier='B', ttl_seconds=_TTL_7D,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def get_financial_data(self, code: str) -> Dict:
+        """财务数据（S 档，TTL 30 天）。未启用/降级时返回 {}。"""
+        windcode = _to_windcode(code)
+        params = {
+            'question': _FUNDAMENTALS_Q_TMPL.format(windcode=windcode),
+            'lang': _WIND_LANG,
+        }
+        result = self._call_wind(
+            'stock_data', 'get_stock_fundamentals', windcode,
+            params, tier='S', ttl_seconds=_TTL_30D,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def get_index_stocks(self, index_code: str) -> List[str]:
+        """指数成分股（S档，TTL 7天）。
+
+        修复 WM-2：Wind 有 get_index_info 工具可返回成分股。
+
+        Input: index_code (如 000300.SH)
+        Output: List[str] (成分股代码) 或 []
+        Pos: wind_adapter.py - 覆写 BaseAdapter 空实现
+        """
+        if not self._enabled:
+            return []
+
+        windcode = _to_windcode(index_code)
+        params = {
+            'question': f"查询{windcode}指数的最新成分股列表",
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_index_info', windcode,
+            params, tier='S', ttl_seconds=_TTL_7D,
+        )
+
+        # 解析成分股列表
+        if isinstance(result, dict):
+            constituents = result.get('constituents', [])
+            if isinstance(constituents, list):
+                # 成分股可能为 {windcode, name, weight} 格式
+                codes = []
+                for c in constituents:
+                    if isinstance(c, dict):
+                        codes.append(str(c.get('windcode', '')))
+                    elif isinstance(c, str):
+                        codes.append(c)
+                return [c for c in codes if c]
+
+        return []
+
+    # ============================ 扩展工具（2026-07-09）============================
+
+    def get_industry_detail(self, industry_name: str) -> Dict:
+        """行业详情（B档，TTL 7天）。
+
+        Input: industry_name (行业名称，如 "食品饮料")
+        Output: Dict(industry_info/stocks) 或 {}
+        Pos: wind_adapter.py - 行业数据工具
+        """
+        if not self._enabled:
+            return {}
+
+        params = {
+            'question': f"查询{industry_name}行业的详细信息和主要公司",
+            'lang': _WIND_LANG,
+        }
+
+        # 行业查询用固定 key（非 windcode）
+        result = self._call_wind(
+            'stock_data', 'get_industry_detail', industry_name,
+            params, tier='B', ttl_seconds=_TTL_7D,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def get_industry_stocks(self, industry_name: str) -> List[str]:
+        """行业成分股（B档，TTL 7天）。
+
+        Input: industry_name (行业名称，如 "白酒")
+        Output: List[str] (行业内股票代码) 或 []
+        Pos: wind_adapter.py - 行业成分查询
+        """
+        if not self._enabled:
+            return []
+
+        params = {
+            'question': f"查询{industry_name}行业的所有A股上市公司股票代码",
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_industry_stocks', industry_name,
+            params, tier='B', ttl_seconds=_TTL_7D,
+        )
+
+        # 解析股票列表
+        if isinstance(result, dict):
+            stocks = result.get('stocks', [])
+            if isinstance(stocks, list):
+                codes = []
+                for s in stocks:
+                    if isinstance(s, dict):
+                        codes.append(str(s.get('windcode', '')))
+                    elif isinstance(s, str):
+                        codes.append(s)
+                return [c for c in codes if c]
+
+        return []
+
+    def get_price_volume_technicals(self, stock_code: str, days: int = 30) -> Dict:
+        """量价技术指标（A档，TTL 1天）。
+
+        Input: stock_code, days (回溯天数，默认 30)
+        Output: Dict(technical_indicators) 或 {}
+        Pos: wind_adapter.py - 技术指标工具（非高频行情）
+        """
+        if not self._enabled:
+            return {}
+
+        windcode = _to_windcode(stock_code)
+        params = {
+            'question': f"查询{windcode}近{days}天的量价技术指标，包含MACD、KDJ、RSI、成交量均线",
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_price_volume_technicals', windcode,
+            params, tier='A', ttl_seconds=24 * 3600,  # 1天
+        )
+        return result if isinstance(result, dict) else {}
+
+    def get_stock_history(self, code: str, start_date: str, end_date: str,
+                          adjust: str = "qfq") -> Optional[pd.DataFrame]:
+        """历史 K 线（A 档，7d TTL）。未启用/降级时返回 None。
+
+        Input: code (股票代码), start_date (YYYY-MM-DD), end_date (YYYY-MM-DD), adjust (复权类型)
+        Output: DataFrame(date/open/high/low/close/volume) 或 None
+        Pos: wind_adapter.py - 覆写 BaseAdapter.get_stock_history
+        """
+        if not self._enabled:
+            return None
+
+        windcode = _to_windcode(code)
+        params = {
+            'windcode': windcode,
+            'start_date': start_date,
+            'end_date': end_date,
+            'adjust': adjust,
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_stock_kline', windcode,
+            params, tier='A', ttl_seconds=_TTL_7D,
+        )
+
+        # 解析 DataFrame
+        if isinstance(result, dict) and 'kline' in result:
+            kline = result['kline']
+            if isinstance(kline, list) and len(kline) > 0:
+                try:
+                    df = pd.DataFrame(kline)
+                    # 归一化列名（Wind 可能返回 date/open/high/low/close/volume）
+                    rename_map = {}
+                    for col in df.columns:
+                        col_lower = str(col).lower()
+                        if 'date' in col_lower or 'time' in col_lower:
+                            rename_map[col] = 'date'
+                        elif 'open' in col_lower:
+                            rename_map[col] = 'open'
+                        elif 'high' in col_lower:
+                            rename_map[col] = 'high'
+                        elif 'low' in col_lower:
+                            rename_map[col] = 'low'
+                        elif 'close' in col_lower:
+                            rename_map[col] = 'close'
+                        elif 'volume' in col_lower or 'vol' in col_lower:
+                            rename_map[col] = 'volume'
+                    df = df.rename(columns=rename_map)
+                    return df
+                except Exception as e:
+                    logger.warning(f"Wind K 线解析失败: {e}")
+                    return None
+
+        return None
+
+    def get_realtime_quote(self, code: str) -> Dict:
+        """实时报价（A 档，1h TTL）。未启用/降级时返回 {}。
+
+        Input: code (股票代码)
+        Output: Dict(price/change/change_pct/volume/...) 或 {}
+        Pos: wind_adapter.py - 实时行情方法
+        """
+        if not self._enabled:
+            return {}
+
+        windcode = _to_windcode(code)
+        params = {
+            'windcode': windcode,
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_stock_realtime', windcode,
+            params, tier='A', ttl_seconds=3600,  # 1h
+        )
+
+        return result if isinstance(result, dict) else {}
+
+    def get_index_data(self, index_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """指数历史（B 档，7d TTL）。未启用/降级时返回 None。
+
+        Input: index_code (指数代码如 000300.SH), start_date (YYYY-MM-DD), end_date (YYYY-MM-DD)
+        Output: DataFrame(date/close/volume) 或 None
+        Pos: wind_adapter.py - 指数历史方法
+        """
+        if not self._enabled:
+            return None
+
+        windcode = _to_windcode(index_code)
+        params = {
+            'index_code': windcode,
+            'start_date': start_date,
+            'end_date': end_date,
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_index_history', windcode,
+            params, tier='B', ttl_seconds=_TTL_7D,
+        )
+
+        # 解析 DataFrame
+        if isinstance(result, dict) and 'history' in result:
+            history = result['history']
+            if isinstance(history, list) and len(history) > 0:
+                try:
+                    df = pd.DataFrame(history)
+                    # 归一化列名
+                    rename_map = {}
+                    for col in df.columns:
+                        col_lower = str(col).lower()
+                        if 'date' in col_lower or 'time' in col_lower:
+                            rename_map[col] = 'date'
+                        elif 'close' in col_lower or 'price' in col_lower:
+                            rename_map[col] = 'close'
+                        elif 'volume' in col_lower or 'vol' in col_lower:
+                            rename_map[col] = 'volume'
+                    df = df.rename(columns=rename_map)
+                    return df
+                except Exception as e:
+                    logger.warning(f"Wind 指数历史解析失败: {e}")
+                    return None
+
+        return None
+
+    def get_macro_data(self, indicator: str, start_date: str, end_date: str) -> Dict:
+        """宏观数据（S 档，30d TTL）。未启用/降级时返回 {}。
+
+        Input: indicator (宏观指标如 GDP), start_date (YYYY-MM-DD), end_date (YYYY-MM-DD)
+        Output: Dict(indicator/data: []) 或 {}
+        Pos: wind_adapter.py - 宏观数据方法
+        """
+        if not self._enabled:
+            return {}
+
+        params = {
+            'indicator': indicator,
+            'start_date': start_date,
+            'end_date': end_date,
+            'lang': _WIND_LANG,
+        }
+
+        result = self._call_wind(
+            'stock_data', 'get_macro_indicator', indicator,
+            params, tier='S', ttl_seconds=_TTL_30D,
+        )
+
+        return result if isinstance(result, dict) else {}
+
+    # ============================ 工具发现与扩展 ============================
+
+    def list_available_tools(self) -> List[Dict]:
+        """列出所有可用工具（保持 initialize 会话调用 tools/list）。
+
+        修复 WM-1：原 _http_call_wind 每次新建 httpx.Client，
+        initialize 会话未保持到 tools/list。本方法在同一 Client 内
+        完成握手 + tools/list，确保 tools/list 成功。
+
+        Input: 无
+        Output: List[{name, description, inputSchema}] 或 []
+        Pos: wind_adapter.py - 工具发现方法，不消耗配额
+        """
+        if not self._enabled:
+            return []
+        # 离线/测试门控：禁止 tools/list 真实出站（与 registry/其他 adapter 一致）
+        if os.getenv('DISABLE_NETWORK', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            logger.debug("DISABLE_NETWORK=1，跳过 Wind tools/list")
+            return []
+
+        endpoint = _WIND_ENDPOINT_TMPL.format(server_type='stock_data')
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+        }
+
+        try:
+            with httpx.Client() as client:
+                # Step 1: initialize（建立会话）
+                init_body = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": _WIND_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "StockAnalSys", "version": "1.0"},
+                    },
+                }
+                init_resp = client.post(endpoint, headers=headers, json=init_body,
+                                        timeout=_WIND_INIT_TIMEOUT)
+                init_resp.raise_for_status()
+                self._parse_mcp_response(init_resp)
+
+                # Step 2: tools/list（同一会话内）
+                list_body = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                }
+                list_resp = client.post(endpoint, headers=headers, json=list_body,
+                                       timeout=30.0)
+                list_resp.raise_for_status()
+                payload = self._parse_mcp_response(list_resp)
+
+                # 解析 tools 数组
+                tools = payload.get('result', {}).get('tools', [])
+                logger.info(f"Wind tools/list 成功: {len(tools)} 工具可用")
+                return tools
+
+        except Exception as e:
+            logger.warning(f"Wind tools/list 失败: {type(e).__name__}: {e}")
+            return []

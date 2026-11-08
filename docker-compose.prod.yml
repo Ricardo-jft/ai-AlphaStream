@@ -1,0 +1,162 @@
+# Input: .env (Key/代理) + Dockerfile + frontend/Dockerfile + nginx/prod.conf
+# Output: 5服务生产拓扑 (backend/frontend/redis/nginx/[opencli可选])
+# Pos: K2 生产级一键启动入口 [NEW-FILE:#20260415-46]
+# 一旦我被修改, 请同步更新 docs/OPERATIONS.md 第1章 Docker生产启动
+
+# ─────────────────────────────────────────────────────────────
+# K2 生产级 docker-compose (2026-04-15 14:32 +08:00)
+#
+# 拓扑:
+#   Internet
+#      │
+#   nginx:80/443 (反代 + SSL终结)
+#      ├── / → frontend:3000 (Next.js standalone)
+#      └── /api/ → backend:8888 (Flask + gunicorn)
+#                      │
+#                      └── redis:6379 (缓存)
+#
+# 启动: docker compose -f docker-compose.prod.yml up -d --build
+# 停止: docker compose -f docker-compose.prod.yml down
+# 日志: docker compose -f docker-compose.prod.yml logs -f [service]
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ── 后端 Flask + 21 adapter + 14 Agent ───────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stockanal-backend:prod
+    container_name: stockanal_backend
+    env_file:
+      - .env
+    environment:
+      # Flask 生产配置
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+      - PYTHONUNBUFFERED=1
+      # Agent/缓存开关
+      - USE_AGENT_SYSTEM=true
+      - USE_REDIS_CACHE=true
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=sqlite:///app/data/stock_analyzer.db
+      - USE_DATABASE=true
+      # 数据层v2 Key (.env透传, 未配置走软降级)
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - OPENCORPORATES_API_KEY=${OPENCORPORATES_API_KEY:-}
+      - SEC_EDGAR_UA=${SEC_EDGAR_UA:-StockAnalSys research@example.com}
+      - AISHUB_USERNAME=${AISHUB_USERNAME:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - SERP_API_KEY=${SERP_API_KEY:-}
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
+      # H4 HTTP代理 (境外adapter必需, 境内直连绕akshare/baostock)
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,redis,frontend,backend,akshare.com,baostock.com,stats.gov.cn,sse.com.cn,szse.cn}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./third_party:/app/third_party:ro
+    ports:
+      # 前端 SSE 默认使用浏览器当前主机的 8888 端口，不能暴露 Docker 内部 backend DNS。
+      - "8888:8888"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # 对齐 K3 健康检查端点 (docs/OPERATIONS.md §6 /health <100ms)
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8888/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - stockanal_net
+
+  # ── 前端 Next.js standalone ──────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: stockanal-frontend:prod
+    container_name: stockanal_frontend
+    environment:
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      # 留空时浏览器使用部署入口同源 API；如需绕过 Nginx，设置为浏览器可解析的公开 URL。
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+      - NEXT_PUBLIC_SSE_URL=${NEXT_PUBLIC_SSE_URL:-}
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - stockanal_net
+
+  # ── Redis 缓存 ────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: stockanal_redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - stockanal_net
+
+  # ── Nginx 反向代理 + SSL ─────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: stockanal_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro  # Comdr将cert/key放入此目录
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - stockanal_net
+
+  # ── OpenCLI (可选 K1桥接) ────────────────────────────────
+  # 启用: docker compose -f docker-compose.prod.yml --profile opencli up -d
+  opencli:
+    build:
+      context: ./third_party
+      dockerfile: Dockerfile
+    image: stockanal-opencli:prod
+    container_name: stockanal_opencli
+    expose:
+      - "4000"
+    restart: unless-stopped
+    profiles:
+      - opencli
+    networks:
+      - stockanal_net
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  stockanal_net:
+    driver: bridge
+    name: stockanal_net

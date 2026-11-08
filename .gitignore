@@ -1,0 +1,137 @@
+# Python
+__pycache__/
+**/__pycache__/
+*/__pycache__/*
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+myenv/
+myenv2/
+.env
+
+# 本地开发文档（docs 外仅 README.md 允许跟踪）
+*.[mM][dD]
+!README.md
+!**/README.md
+
+# docs 仅保留截图与效果文件
+/docs/*
+!/docs/screenshots/
+!/docs/screenshots/**
+
+# 本地开发目录（任意层级；置于所有反忽略规则之后）
+**/skill参考/
+**/tencent-news/
+**/nginx/
+**/scripts/
+**/logs/
+**/node_modules
+**/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+# 运行日志 / E2E 归档（CLAUDE.md 资源策略 + 铁律 #2 衔接）：
+# - *.log 全局忽略
+# - logs/ 整目录忽略（覆盖 logs/*.log / logs/*.log.* / logs/real_browser_e2e_*/ 等）
+# - 已 tracked 的 logs/*.md 报告（adapter_smoke / agent_audit / e2e_j2 / security_audit）不受影响
+*.log
+logs/
+log/
+
+# Database
+*.db
+*.sqlite3
+*.sqlite
+data/
+
+# Docker
+.docker/
+
+# Test
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Git-only local assets (kept locally, excluded from the remote repository)
+/images/
+/test-chat-error.sh
+/conftest.py
+
+# 测试资产随仓库开源（2026-11-08 二次开发）：tests/ 与 pytest.ini 纳入版本管理
+
+# E2E 临时输出（脚本与截图保留）
+e2e/_compare_output.txt
+e2e/_*.txt
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Local development settings
+local_settings.py
+
+# Redis
+dump.rdb
+
+# Other
+*.bak
+*.tmp
+*.temp
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local 
+
+# md
+akshare.md
+.server.pid
+
+# Next.js
+.next/
+out/
+node_modules/
+
+# Ruff cache
+.ruff_cache/
+
+# Eval results
+eval_results/
+
+# Third-party vendored sources (non-PyPI)
+third_party/

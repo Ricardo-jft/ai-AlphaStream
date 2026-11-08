@@ -1,0 +1,334 @@
+# -*- coding: utf-8 -*-
+"""
+Input: adapter名(如eastmoney/hot-rank) + 可选args列表 + 超时
+Output: list[dict] 结构化热股/爬取数据；异常时返回[]并log.warning
+Pos: app/adapters/opencli_bridge.py — OpenCLI浏览器爬取桥，作为第二支柱数据源
+     覆盖三大热股榜(东财/通达信/同花顺)及后续雪球/股吧/1688等爬取适配器
+一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
+
+权威源（R4治理 2026-04-15 21:40 +08:00 检索）：
+- https://github.com/jackwener/OpenCLI   README.md (Strategy.COOKIE / -f json)
+- `opencli xueqiu comments <symbol> --limit=N -f json` (内置, 替代原 xueqiu/discuss)
+- `opencli sinafinance news --limit=N -f json` (内置, 替代原 cls/telegraph)
+- `opencli sinafinance stock-rank -f json` (内置, 替代原 eastmoney/guba)
+- https://docs.python.org/3.12/library/subprocess.html  subprocess.run 最佳实践
+
+R4变更: opencli命令格式为 `opencli <group> <action> [pos_args] -f json`,
+  本 bridge 的 opencli_call() 已改造为自动拆分 group/action +
+  自动将 --symbol=/--code= 转为位置参数 (opencli 契约要求).
+
+[NEW-FILE:#20260415-02]
+"""
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+import subprocess
+import time
+from functools import lru_cache
+from typing import List, Dict, Optional
+
+import pandas as pd
+
+from .base_adapter import BaseAdapter
+
+logger = logging.getLogger(__name__)
+
+# 缓存TTL：5分钟（热股榜刷新频率足够）
+_CACHE_TTL_SECONDS = 300
+
+
+def _ttl_bucket() -> int:
+    """把时间切为5分钟桶，用于 lru_cache 参数实现 TTL 效果"""
+    return int(time.time() // _CACHE_TTL_SECONDS)
+
+
+class OpenCLIBridge(BaseAdapter):
+    """OpenCLI 子进程桥接器
+
+    通过 `opencli <adapter> --format=json` 调用底层浏览器爬取能力。
+    Node/opencli 未安装 -> 降级返回空列表 + log.warning，绝不抛异常影响上游。
+    """
+
+    OPENCLI_BIN = "opencli"
+    NODE_BIN = "node"
+
+    @property
+    def name(self) -> str:
+        return "opencli"
+
+    # -------------------- 环境探测 --------------------
+    @staticmethod
+    def _check_environment() -> Optional[str]:
+        """返回 None 表示环境OK；否则返回失败原因字符串"""
+        if shutil.which(OpenCLIBridge.NODE_BIN) is None:
+            return "node_not_installed"
+        if shutil.which(OpenCLIBridge.OPENCLI_BIN) is None:
+            return "opencli_not_installed"
+        return None
+
+    # -------------------- 通用调用 --------------------
+    def opencli_call(
+        self,
+        adapter: str,
+        args: Optional[List[str]] = None,
+        timeout: int = 30,
+    ) -> List[Dict]:
+        """通用 OpenCLI 调用入口
+
+        R4治理 (2026-04-15 21:40 +08:00):
+          OpenCLI 实际命令格式为 `opencli <group> <action> [args] -f json`
+          (`--format=json` 也兼容), 而不是 `opencli <group>/<action>`.
+          - 若 adapter 含 "/" 自动拆为 [group, action].
+          - 参数 `--symbol=X` 自动转为位置参数 X (opencli 契约).
+          - `--format=json` 保留兼容, 首选 `-f json`.
+
+        Args:
+            adapter: OpenCLI 适配器路径, 如 "xueqiu/comments" 或 "xueqiu comments"
+            args: 额外命令行参数 (--key=value 或 位置参数)
+            timeout: 子进程超时(秒), 默认30
+
+        Returns:
+            list[dict]：失败/异常时返回空列表
+        """
+        reason = self._check_environment()
+        if reason:
+            logger.warning(
+                "[OpenCLI] 环境未就绪(%s)，降级返回空列表 adapter=%s",
+                reason, adapter,
+            )
+            return []
+
+        # R4: 拆分 group/action
+        cmd_parts = [self.OPENCLI_BIN]
+        if "/" in adapter:
+            grp, act = adapter.split("/", 1)
+            cmd_parts.extend([grp, act])
+        elif " " in adapter:
+            cmd_parts.extend(adapter.split())
+        else:
+            cmd_parts.append(adapter)
+
+        # 位置参数优先(如 symbol), 然后 --key=value
+        positional: List[str] = []
+        flags: List[str] = []
+        for a in (args or []):
+            # opencli xueqiu comments 需要 symbol 作为位置参数而非 --symbol=
+            if a.startswith("--symbol="):
+                positional.append(a.split("=", 1)[1])
+            elif a.startswith("--code="):
+                positional.append(a.split("=", 1)[1])
+            else:
+                flags.append(a)
+        cmd_parts.extend(positional)
+        cmd_parts.extend(flags)
+        # 强制 JSON 输出
+        cmd_parts.extend(["-f", "json"])
+        cmd = cmd_parts
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("[OpenCLI] 超时(%ss) adapter=%s", timeout, adapter)
+            return []
+        except (OSError, FileNotFoundError) as exc:
+            logger.warning("[OpenCLI] 调用失败 adapter=%s err=%s", adapter, exc)
+            return []
+
+        if proc.returncode != 0:
+            logger.warning(
+                "[OpenCLI] 非零退出码 adapter=%s rc=%s stderr=%s",
+                adapter, proc.returncode, (proc.stderr or "")[:200],
+            )
+            return []
+
+        stdout = (proc.stdout or "").strip()
+        if not stdout:
+            logger.warning("[OpenCLI] 空stdout adapter=%s", adapter)
+            return []
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "[OpenCLI] JSON解析失败 adapter=%s err=%s raw=%s",
+                adapter, exc, stdout[:200],
+            )
+            return []
+
+        # 兼容两种schema：{"data":[...]} 或 [...]
+        if isinstance(data, dict):
+            data = data.get("data") or data.get("items") or []
+        if not isinstance(data, list):
+            logger.warning("[OpenCLI] schema异常 adapter=%s type=%s", adapter, type(data))
+            return []
+
+        return data
+
+    # -------------------- 三大热股榜 --------------------
+    def get_eastmoney_hot_rank(self) -> List[Dict]:
+        """东方财富热股榜"""
+        return _cached_hot_rank("eastmoney/hot-rank", _ttl_bucket())
+
+    def get_tdx_hot_rank(self) -> List[Dict]:
+        """通达信热股榜"""
+        return _cached_hot_rank("tdx/hot-rank", _ttl_bucket())
+
+    def get_ths_hot_rank(self) -> List[Dict]:
+        """同花顺热股榜"""
+        return _cached_hot_rank("ths/hot-rank", _ttl_bucket())
+
+    # -------------------- P2-B1 自建社交/舆情适配器 --------------------
+    # 对应 clis/xueqiu/discuss.js / clis/eastmoney/guba.js / clis/cls/telegraph.js
+    # 权威源 (2026-04-15 12:30 +08:00)：
+    #   https://github.com/jackwener/OpenCLI/pull/1025 (hot-rank 模板)
+    #   https://xueqiu.com/S/{symbol}/TIMELINE
+    #   https://guba.eastmoney.com/list,{code}.html
+    #   https://www.cls.cn/telegraph
+    def get_xueqiu_discuss(self, symbol: str, limit: int = 30) -> List[Dict]:
+        """雪球个股讨论流
+
+        R4治理: 改用 opencli 内置 `xueqiu comments` (项目原 `xueqiu/discuss` 不存在于
+        opencli@1.7.3 内置命令中, 实际命令为 `xueqiu comments <symbol>`).
+
+        Args:
+            symbol: 雪球股票代码, 含交易所前缀 (如 SZ000001 / SH600519)
+            limit: 返回条数上限, 默认30
+
+        Returns:
+            list[dict]: 雪球 comments 原生字段 [author,text,likes,replies,retweets,
+            created_at,url]; 异常降级 []
+        """
+        if not symbol:
+            logger.warning("[OpenCLI] xueqiu/comments symbol必填")
+            return []
+        return self.opencli_call(
+            "xueqiu/comments",
+            args=[f"--symbol={symbol}", f"--limit={int(limit)}"],
+            timeout=45,
+        )
+
+    def get_eastmoney_guba(self, code: str, pages: int = 1) -> List[Dict]:
+        """东方财富股吧帖子列表
+
+        R4治理: opencli@1.7.3 内置无 eastmoney/guba, 改用 sinafinance stock-rank
+        作为替代情绪信号 (新浪财经热搜榜, code 作为参考不过滤).
+
+        Args:
+            code: 6位A股代码
+            pages: 抓取页数(忽略, 仅为兼容)
+
+        Returns:
+            list[dict]: 异常降级 []
+        """
+        if not code or not code.isdigit() or len(code) != 6:
+            logger.warning("[OpenCLI] eastmoney/guba code必须为6位数字 got=%s", code)
+            return []
+        # 替代源: sinafinance stock-rank 热搜榜 (cookie策略, 无需code参数)
+        return self.opencli_call(
+            "sinafinance/stock-rank",
+            args=[],
+            timeout=45,
+        )
+
+    def get_cls_telegraph(self, limit: int = 50) -> List[Dict]:
+        """财联社电报实时流
+
+        R4治理: opencli@1.7.3 内置无 cls/telegraph, 改用 sinafinance news
+        (新浪财经 7x24 实时快讯) 作为最接近的公开替代.
+
+        Args:
+            limit: 返回条数上限, 默认50
+
+        Returns:
+            list[dict]: 异常降级 []
+        """
+        return self.opencli_call(
+            "sinafinance/news",
+            args=[f"--limit={int(limit)}"],
+            timeout=30,
+        )
+
+    # -------------------- Registry 别名 (I1) --------------------
+    # domain=sentiment_social → method=get_social_sentiment
+    def get_social_sentiment(self, code: Optional[str] = None, limit: int = 30,
+                              **kwargs) -> List[Dict]:
+        """Registry契约别名 — 聚合雪球讨论 + 东财股吧 + 热榜信号。
+
+        Args:
+            code: 6位A股代码 (或带交易所前缀雪球码); 无则只回热榜
+            limit: 每源上限
+        Returns:
+            List[Dict]: [{source, ...}] 扁平合并；异常降级 []
+        """
+        out: List[Dict] = []
+        try:
+            if code:
+                c = str(code).strip()
+                # 雪球: 需要交易所前缀
+                if c.isdigit() and len(c) == 6:
+                    sxq = ("SH" if c.startswith("6") else "SZ") + c
+                else:
+                    sxq = c
+                try:
+                    for it in self.get_xueqiu_discuss(symbol=sxq, limit=limit) or []:
+                        if isinstance(it, dict):
+                            it.setdefault("source", "xueqiu")
+                            out.append(it)
+                except Exception:
+                    pass
+                if c.isdigit() and len(c) == 6:
+                    try:
+                        for it in self.get_eastmoney_guba(code=c, pages=1) or []:
+                            if isinstance(it, dict):
+                                it.setdefault("source", "eastmoney_guba")
+                                out.append(it)
+                    except Exception:
+                        pass
+            # 无论是否有code，都附带一份东财热榜前若干条作为全局情绪基线
+            try:
+                for it in (self.get_eastmoney_hot_rank() or [])[: max(5, int(limit // 3))]:
+                    if isinstance(it, dict):
+                        it.setdefault("source", "eastmoney_hot")
+                        out.append(it)
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            logger.warning("[OpenCLI] get_social_sentiment 失败 code=%s: %s", code, e)
+            return []
+
+    # -------------------- BaseAdapter抽象方法占位 --------------------
+    # OpenCLI 主职责是爬取/热榜，K线/财务/指数成分非其能力范围，
+    # 统一返回空对象以满足抽象接口契约，供 fallback_manager 跳过。
+    def get_stock_history(self, code: str, start_date: str, end_date: str,
+                          adjust: str = "qfq") -> pd.DataFrame:
+        return pd.DataFrame()
+
+    def get_index_stocks(self, index_code: str) -> List[str]:
+        return []
+
+    def get_stock_info(self, code: str) -> Dict:
+        return {}
+
+    def get_financial_data(self, code: str) -> Dict:
+        return {}
+
+    def health_check(self) -> bool:
+        return self._check_environment() is None
+
+
+# -------------------- 模块级 TTL 缓存 --------------------
+# lru_cache 结合 _ttl_bucket 实现 5min 自动过期
+@lru_cache(maxsize=32)
+def _cached_hot_rank(adapter: str, bucket: int) -> List[Dict]:
+    """TTL缓存包装：同一 (adapter, bucket) 命中缓存，bucket跨越即自然失效"""
+    bridge = OpenCLIBridge()
+    return bridge.opencli_call(adapter)

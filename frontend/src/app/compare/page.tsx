@@ -1,0 +1,184 @@
+// Input: 用户输入的多个股票代码
+// Output: 多股票对比页面UI，含标签管理、AI对比分析渐变按钮(≥2只)、快速对比表格，Dark Glassmorphism风格
+// Pos: src/app/compare/page.tsx - 多股票对比路由页面
+// 注意：跳转首页必须用 ?q= 参数——chat-panel 只识别 q/prefill，用 message= 会跳到首页但不触发分析
+// 注意：快速对比表（/api/stock_profile，baostock）与 AI 分析（akshare）PE/PB 已对齐到同一交易日，
+//       ROE 主口径统一为「最近年报」，改动取数逻辑时勿退回 iloc[0]（详见 BUG-16）
+// 一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
+
+"use client";
+import { useState, useEffect } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Plus, X, BarChart3, Sparkles } from "lucide-react";
+import { GlassCard } from "@/components/common/glass-card";
+import { getStockName } from "@/lib/utils/stock-code";
+import { apiClient } from "@/lib/api/client";
+import Link from "next/link";
+
+interface Profile {
+  stock_name?: string;
+  industry?: string | null;
+  market_cap?: number | null;
+  pe_ttm?: number | null;
+  pb?: number | null;
+  roe?: number | null;
+}
+
+function fmtMarketCap(v?: number | null): string {
+  if (v == null || !isFinite(v)) return "--";
+  if (v >= 1e12) return `${(v / 1e12).toFixed(2)}万亿`;
+  if (v >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
+  return v.toFixed(0);
+}
+
+export default function ComparePage() {
+  const [codes, setCodes] = useState<string[]>(["600519", "000858"]);
+  const [newCode, setNewCode] = useState("");
+  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
+
+  useEffect(() => {
+    // 每个code独立获取并写入，不用cancelled flag以免StrictMode二次mount丢数据
+    codes.forEach(async c => {
+      try {
+        const r = await apiClient.get<Profile>("/api/stock_profile", { stock_code: c });
+        setProfiles(prev => ({ ...prev, [c]: r }));
+      } catch {
+        setProfiles(prev => prev[c] ? prev : { ...prev, [c]: { stock_name: getStockName(c) } });
+      }
+    });
+  }, [codes]);
+
+  const cellValue = (metric: string, code: string): string => {
+    const p = profiles[code];
+    if (metric === '名称') return p?.stock_name || getStockName(code);
+    if (!p) return '--';
+    if (metric === '行业') return p.industry || '--';
+    if (metric === '市值') return fmtMarketCap(p.market_cap);
+    if (metric === 'PE(TTM)') return p.pe_ttm != null ? p.pe_ttm.toFixed(2) : '--';
+    if (metric === 'PB') return p.pb != null ? p.pb.toFixed(2) : '--';
+    if (metric === 'ROE' || metric === 'ROE(年报)') return p.roe != null ? p.roe.toFixed(2) + '%' : '--';
+    return '--';
+  };
+
+  const addCode = () => {
+    if (newCode && /^\d{6}$/.test(newCode) && !codes.includes(newCode) && codes.length < 4) {
+      setCodes([...codes, newCode]);
+      setNewCode("");
+    }
+  };
+
+  const removeCode = (code: string) => {
+    setCodes(codes.filter(c => c !== code));
+  };
+
+  const TAG_COLORS = ['bg-[#3737CC]', 'bg-[#46BEA3]', 'bg-[#FF8767]', 'bg-[#6B5EE4]'];
+
+  // 统一入口：chat-panel 只识别 ?q=（直接发送）与 ?prefill=（仅预填），故此处必须用 q
+  const comparePrompt = `对比分析这些股票的投资价值：${codes.join(' vs ')}`;
+  const compareHref = `/?q=${encodeURIComponent(comparePrompt)}`;
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 pb-16 space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold flex items-center gap-2">
+          <BarChart3 className="h-6 w-6" />
+          多股票对比
+        </h1>
+        <div className="flex gap-2">
+          <Input
+            value={newCode}
+            onChange={e => setNewCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            placeholder="添加代码"
+            className="w-28 bg-foreground/[0.04] dark:bg-white/[0.04] border-foreground/[0.1] dark:border-white/[0.1]"
+            maxLength={6}
+            onKeyDown={e => e.key === 'Enter' && addCode()}
+          />
+          <Button size="sm" onClick={addCode} disabled={codes.length >= 4} className="bg-foreground/[0.08] dark:bg-white/[0.08] border border-foreground/[0.12] dark:border-white/[0.12] hover:bg-foreground/[0.15] dark:hover:bg-white/[0.15] text-foreground">
+            <Plus className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+
+      {/* 对比股票标签 */}
+      <div className="flex gap-2 flex-wrap">
+        {codes.map((code, i) => (
+          <div key={code} className="flex items-center gap-1.5 bg-foreground/[0.06] dark:bg-white/[0.06] border border-foreground/[0.1] dark:border-white/[0.1] rounded-full px-3 py-1.5">
+            <div className={`w-2 h-2 rounded-full ${TAG_COLORS[i]}`} />
+            <Link href={`/stock/${code}`} className="font-mono text-sm hover:text-[#6B5EE4] transition-colors">{code}</Link>
+            <span className="text-xs text-muted-foreground dark:text-white/40">{profiles[code]?.stock_name || getStockName(code)}</span>
+            <button onClick={() => removeCode(code)} className="ml-1 text-muted-foreground dark:text-white/30 hover:text-foreground dark:hover:text-white/70 transition-colors" aria-label={`移除${code}`}>
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {/* AI对比分析按钮 - 至少2只股票时显示 */}
+      {codes.length >= 2 && (
+        <Link href={compareHref} className="block">
+          <button className="w-full group relative overflow-hidden rounded-2xl px-6 py-4 bg-gradient-to-r from-[#3737CC] via-[#5A4ED3] to-[#6B5EE4] hover:from-[#4545DD] hover:via-[#6B5EE4] hover:to-[#8B7EFF] shadow-lg shadow-[#6B5EE4]/20 hover:shadow-xl hover:shadow-[#6B5EE4]/30 transition-all duration-300 flex items-center justify-center gap-3">
+            <Sparkles className="h-5 w-5 text-white group-hover:rotate-12 transition-transform duration-300" />
+            <span className="text-base font-semibold text-white">AI对比分析</span>
+            <span className="text-xs text-muted-foreground dark:text-white/70">（{codes.length}只）</span>
+          </button>
+        </Link>
+      )}
+
+      {/* AI对比分析入口 */}
+      <GlassCard padding="lg" glow="brand">
+        <div className="text-center space-y-4">
+          <p className="text-muted-foreground dark:text-white/50">选择2-4只股票，点击下方按钮启动AI对比分析</p>
+          {codes.length >= 2 ? (
+            <Link href={compareHref}>
+              <Button size="lg" className="gap-2 bg-[#3737CC] hover:bg-[#4545DD] text-white">
+                启动AI对比分析
+              </Button>
+            </Link>
+          ) : (
+            <Button size="lg" disabled className="gap-2 bg-[#3737CC] hover:bg-[#4545DD] text-white">
+              启动AI对比分析
+            </Button>
+          )}
+          <p className="text-xs text-muted-foreground dark:text-white/30">
+            AI将从技术面、基本面、资金面、风险等维度综合对比
+          </p>
+        </div>
+      </GlassCard>
+
+      {/* 基础对比表格 */}
+      {codes.length >= 2 && (
+        <GlassCard padding="lg">
+          <h2 className="text-sm font-semibold mb-4">快速对比</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-foreground/[0.08] dark:border-white/[0.08]">
+                  <th className="text-left py-2.5 px-3 text-muted-foreground dark:text-white/40 text-xs font-medium">指标</th>
+                  {codes.map(code => (
+                    <th key={code} className="text-right py-2.5 px-3 font-mono text-xs font-medium">{code}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {['名称', '行业', '市值', 'PE(TTM)', 'PB', 'ROE(年报)'].map(metric => (
+                  <tr key={metric} className="border-b border-foreground/[0.04] dark:border-white/[0.04] hover:bg-foreground/[0.03] dark:hover:bg-white/[0.03] transition-colors">
+                    <td className="py-2.5 px-3 text-muted-foreground dark:text-white/40">{metric}</td>
+                    {codes.map(code => (
+                      <td key={code} className="text-right py-2.5 px-3 font-mono">
+                        {cellValue(metric, code)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-muted-foreground dark:text-white/25 mt-3 text-center">
+            PE/PB 为最近交易日收盘口径，ROE 为最近年报口径（加权）；AI 对比使用同一数据源，时点以分析中的「估值日期」为准
+          </p>
+        </GlassCard>
+      )}
+    </div>
+  );
+}

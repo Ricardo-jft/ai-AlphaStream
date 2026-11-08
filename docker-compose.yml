@@ -1,0 +1,155 @@
+services:
+  # 后端服务
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stockanal_backend
+    ports:
+      - "8888:8888"
+    env_file:
+      - .env
+    environment:
+      # Flask 配置
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+      - PORT=8888
+
+      # Agent 配置
+      - USE_AGENT_SYSTEM=true
+      - MAX_QA=${MAX_QA:-20}
+
+      # 数据库配置
+      - DATABASE_URL=sqlite:///data/stock_analyzer.db
+      - USE_DATABASE=${USE_DATABASE:-False}
+      - WIND_DATABASE_URL=sqlite:///data/wind_cache.db
+
+      # Redis 配置
+      - REDIS_URL=redis://redis:6379
+      - USE_REDIS_CACHE=${USE_REDIS_CACHE:-False}
+
+      # 日志配置
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE=logs/stock_analyzer.log
+
+      # 鉴权配置
+      - AUTH_REQUIRED=${AUTH_REQUIRED:-false}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+
+      # 网络配置
+      - DISABLE_NETWORK=${DISABLE_NETWORK:-0}
+      - MOCK_LLM=${MOCK_LLM:-0}
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    # 关键修复（BUG-12）：gunicorn 默认 sync worker + timeout=30s，会把处理超过 30 秒的请求
+    # 连同进程一起杀掉。实测 /api/ai/chat 深度分析在 30.9s 断流（无 done 事件，前端永远转圈），
+    # /api/market_stream（无限 SSE）更是每 30s 被杀一次 worker。改用 gthread + 放宽 timeout。
+    command:
+      - gunicorn
+      - --bind
+      - 0.0.0.0:8888
+      - --workers
+      - "4"
+      - --worker-class
+      - gthread
+      - --threads
+      - "8"
+      - --timeout
+      - "300"
+      - --graceful-timeout
+      - "30"
+      - --keep-alive
+      - "75"
+      - app.web.web_server:app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - stockanal_network
+
+  # 前端服务
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # 说明：frontend/Dockerfile 未声明 ARG NEXT_PUBLIC_API_URL，故构建期无法内联该变量，
+      # 客户端 bundle 中其值为空，浏览器端会走 window.location.hostname:8888 兜底（可访问宿主机 8888）。
+      # 若将来在 Dockerfile 中声明 ARG，须注意浏览器无法解析容器名 backend。
+    container_name: stockanal_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      # 服务端路由（/health、/api/*）运行在容器内，必须用容器网络名；
+      # 若填 localhost:8888 会指向前端容器自身，导致 fetch failed / 502（后端不可达）。
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://backend:8888}
+      - NEXT_PUBLIC_API_DEFAULT_TIMEOUT_MS=${NEXT_PUBLIC_API_DEFAULT_TIMEOUT_MS:-60000}
+      - NEXT_PUBLIC_SSE_HEARTBEAT_TIMEOUT_MS=${NEXT_PUBLIC_SSE_HEARTBEAT_TIMEOUT_MS:-120000}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # node:20-alpine 镜像内无 curl（实测 command -v curl 为空），改用 wget；
+      # 且必须用 127.0.0.1 而非 localhost：容器内 localhost 优先解析到 ::1，
+      # 而 Next.js 仅监听 IPv4 0.0.0.0，用 localhost 会 Connection refused。
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - stockanal_network
+
+  # Redis 缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: stockanal_redis
+    profiles:
+      - cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - stockanal_network
+
+  # Nginx 反向代理（可选，生产环境推荐）
+  nginx:
+    image: nginx:alpine
+    container_name: stockanal_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    profiles:
+      - production
+    networks:
+      - stockanal_network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  stockanal_network:
+    driver: bridge

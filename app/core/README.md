@@ -1,0 +1,15 @@
+# app/core/ - 核心基础设施
+- ai_client.py(AI统一客户端；支持chat/Function Calling/流式输出；提供模型配置脱敏快照、来源判定及上游model/correlation日志)
+- tools.py(共享工具注册表；Sprint2 持仓只读；Sprint4 propose/decide/apply；Sprint4+ plan/skill；advance_plan_step 状态机；禁假下单)
+- write_proposal.py(Sprint4 写仓提案 + approval_id 闸门；HITL 桥；local_mark_only；publish write_proposal 事件) [NEW-FILE:#20260724-S4]
+- plan_dag.py(Sprint4+ 轻量 Plan DAG：depends_on/环检测/状态机；list 过滤 conversation_id/status；advance_step；plan.created/plan.step 事件；不抓数不下单) [NEW-FILE:#20260724-S4B]
+- skill_loader.py(Sprint4+ Skills：data/skills 热读优先元数据(id/title/source/kind/has_hint/path) + builtin(含 tool_discipline) + reflection → system_hint；list_agent_skills 出口完整；禁替代 adapters) [NEW-FILE:#20260724-S4B]
+- intent_router.py(Sprint2 chat 意图规则路由：portfolio/cross_market/market_overview/single_stock_deep/general) [NEW-FILE:#20260723-S2]
+- artifact_wrapper.py(Generative UI后端数据协议层，将工具结果包装为前端可渲染的Artifact结构化JSON)
+- data_provider.py(数据层), cache.py(缓存), search.py(搜索), agent_memory.py(Agent长期记忆)
+- event_bus.py(Agent事件总线 + SSE 桥；G3 dual alias；plan.created/plan.step/write_proposal 主题)
+- conversation.py(对话上下文持久化；Sprint4 decision_artifacts 会话级挂载)
+- database.py(数据库), fallback_manager.py(降级管理)
+- wind_budget.py(Wind数据源省积分底座：WindCache持久化缓存 + WindQuota日配额闸门S/A/B硬隔离，独立sqlite引擎与业务库隔离) [NEW-FILE:#20260529-WIND-01]
+- tool_guardrails.py(P0-1 turn 级工具失败护栏：同 tool+归一化 args 连续失败 block/halt；ContextVar 挂 execute_tool / chat FC) [NEW-FILE:#20260723-P01]
+- 一旦这里的结构发生变化，请务必更新我
