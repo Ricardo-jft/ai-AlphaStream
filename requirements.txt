@@ -30,7 +30,7 @@ statsmodels==0.14.5
 pytest==7.3.1
 pytest-randomly>=3.15.0   # Sprint 3-I: 随机顺序测试，默认 addopts 关闭(-p no:randomly)，显式用 -p randomly --randomly-seed=N 启用
 tavily-python
-duckduckgo-search>=7.0.0
+duckduckgo-search>=8.1.1
 
 # Deployment & Caching
 supervisor==4.2.5
