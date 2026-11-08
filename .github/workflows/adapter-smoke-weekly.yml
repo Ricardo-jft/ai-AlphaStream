@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt
       - name: Run smoke
         run: python scripts/smoke_adapters.py > smoke_output.log 2>&1 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: smoke-log-${{ github.run_id }}
           path: smoke_output.log
